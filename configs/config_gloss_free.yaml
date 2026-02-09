@@ -1,0 +1,14 @@
+name: GFSLT-VLP
+data:
+  train_label_path: ./data/Phonexi-2014T/labels.train
+  dev_label_path: ./data/Phonexi-2014T/labels.dev
+  test_label_path: ./data/Phonexi-2014T/labels.test
+  img_path: /home/ec2-user/german_training/dataset/
+  max_length: 300
+training:
+  wandb: disabled # online or disabled
+  scale_embedding: False
+model:
+  transformer:  ./pretrain_models/MBart_trimmed
+  visual_encoder: ./pretrain_models/mytran
+  sign_proj: True
