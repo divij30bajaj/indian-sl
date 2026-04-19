@@ -152,6 +152,7 @@ class S2T_Dataset(Dataset.Dataset):
 
         tgt_batch, img_tmp, src_length_batch, name_batch = [], [], [], []
 
+        # img_sample is an array of N frames from a single video (N, 3, 224, 224); tgt_sample is the corresponding text
         for name_sample, img_sample, tgt_sample in batch:
             name_batch.append(name_sample)
 
@@ -163,7 +164,10 @@ class S2T_Dataset(Dataset.Dataset):
         video_length = torch.LongTensor([np.ceil(len(vid) / 4.0) * 4 + 16 for vid in img_tmp])
         left_pad = 8
         right_pad = int(np.ceil(max_len / 4.0)) * 4 - max_len + 8
+
+        # max_len is highest number of frames in a video + 16 + 0-3 extra frames so that the final length is divisible by 4
         max_len = max_len + left_pad + right_pad
+        
         padded_video = [torch.cat(
             (
                 vid[0][None].expand(left_pad, -1, -1, -1),
@@ -173,22 +177,42 @@ class S2T_Dataset(Dataset.Dataset):
             , dim=0)
             for vid in img_tmp]
 
+        # Each padded_video[i] is initially padded like this: 
+        # [8 left frames] + [original video] + [remaining padding so that final length is max_len]
+        # where max_len is highest number of frames in a video + 16 + 0-3 extra frames so that the final length is divisible by 4
+        # The padding on the right first matches the max number of frames in the batch, then adds 8 frames and then 0-3 more
+        # Below line removes extra right padding and keeps it to 8 frames + 0-3 extra for each video
         img_tmp = [padded_video[i][0:video_length[i], :, :, :] for i in range(len(padded_video))]
 
+        # Each padded_video[i] is one video in the batch with video_lenght[i] frames (video_length[i], 3, 224, 224)
+        # img_tmp is the batch of B videos
         for i in range(len(img_tmp)):
             src_length_batch.append(len(img_tmp[i]))
         src_length_batch = torch.tensor(src_length_batch)
 
+        # Two questions: Why was global padding necessary, where is it used?
+        # Now that each sample has different frames (16-19 padding in total over the number of frames in that video), 
+        # how is same seq length achieved later?
         img_batch = torch.cat(img_tmp, 0)
 
+        # This is modeling how sequence length changes after two temporal convolution layers.
+        # new_src_lengths = number of timesteps after temporal conv
         new_src_lengths = (((src_length_batch - 5 + 1) / 2) - 5 + 1) / 2  # 和后面的Temporal卷积结合
         new_src_lengths = new_src_lengths.long()
+
+        # For each video in the batch that has i frames after two temporal convolutions, 
+        # a 1-D tensor is made of length i with all values = 8
         mask_gen = []
         for i in new_src_lengths:
             tmp = torch.ones([i]) + 7
             mask_gen.append(tmp)
+
+        # Pad masks of all videos in the batch to batch size: each element in mask_gen is a 1-D tensor of max(new_src_lengths) length
         mask_gen = pad_sequence(mask_gen, padding_value=PAD_IDX, batch_first=True)
+
+        # valid positions → 1; padded positions → 0
         img_padding_mask = (mask_gen != PAD_IDX).long()
+
         with self.tokenizer.as_target_tokenizer():
             tgt_input = self.tokenizer(tgt_batch, return_tensors="pt", padding=True, truncation=True)
 

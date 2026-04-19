@@ -8,6 +8,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.nn import functional as F
 from torch import nn
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
 import gc
 # *transformers
@@ -60,6 +62,7 @@ from definition import *
 import gzip
 import pickle
 import torch
+import deepspeed
 
 import signcl as signcl
 cl_criterion = signcl.SignCL()
@@ -226,15 +229,23 @@ def main(args, config):
         print('Unexpected keys: \n', '\n'.join(ret.unexpected_keys))
 
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-    n_parameters = utils.count_parameters_in_MB(model_without_ddp)
-    print(f'number of params: {n_parameters}M')
-
     optimizer = create_optimizer(args, model_without_ddp)
     lr_scheduler, _ = create_scheduler(args, optimizer)
+
+    if args.distributed:
+        # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+
+        model, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            model_parameters=[p for p in model.parameters() if p.requires_grad],
+            config="ds_config.json"
+        )
+        model_without_ddp = model.module
+
+    n_parameters = utils.count_parameters_in_MB(model_without_ddp)
+    print(f'number of params: {n_parameters}M')
 
     text_decoder = Text_Decoder(config).to(device)
 
@@ -259,14 +270,16 @@ def main(args, config):
 
     output_dir = Path(args.output_dir)
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
+        load_path = args.resume.replace("checkpoint", "checkpoint_ds")
+        model.load_checkpoint(load_path, tag="epoch")
+
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         text_decoder.load_state_dict(checkpoint['text_decoder'], strict=True)
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            #optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
-
+    
     if args.eval:
         if not args.resume:
             logger.warning('Please specify the trained model: --resume /path/to/best_checkpoint.pth')
@@ -298,13 +311,21 @@ def main(args, config):
         if args.output_dir:
             checkpoint_paths = [output_dir / f'checkpoint.pth']
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'text_decoder': TD_train_dict['text_decoder'].state_dict(),
-                    'epoch': epoch,
-                }, checkpoint_path)
+                save_dir = str(checkpoint_path).replace("checkpoint", "checkpoint_ds")
+                model.save_checkpoint(save_dir, tag="epoch", client_state={"epoch": epoch})
+
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                    
+                if utils.is_main_process():
+                    state_dict = get_fp32_state_dict_from_zero_checkpoint(save_dir, tag="epoch")
+                    torch.save({
+                        'model': state_dict,
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'text_decoder': TD_train_dict['text_decoder'].state_dict(),
+                        'epoch': epoch,
+                    }, checkpoint_path)
 
         test_stats = evaluate(args, dev_dataloader, model, model_without_ddp, criterion, config, epoch, UNK_IDX,
                               SPECIAL_SYMBOLS, PAD_IDX, device, TD_train_dict)
@@ -314,14 +335,21 @@ def main(args, config):
             if args.output_dir:
                 checkpoint_paths = [output_dir / 'best_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'text_decoder': TD_train_dict['text_decoder'].state_dict(),
-                        'epoch': epoch,
-                        # 'args': args,
-                    }, checkpoint_path)
+                    save_dir = str(checkpoint_path).replace("checkpoint", "checkpoint_ds")
+                    model.save_checkpoint(save_dir, tag="epoch", client_state={"epoch": epoch})
+
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+
+                    if utils.is_main_process():
+                        state_dict = get_fp32_state_dict_from_zero_checkpoint(save_dir, tag="epoch")
+                        torch.save({
+                            'model': state_dict,
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'text_decoder': TD_train_dict['text_decoder'].state_dict(),
+                            'epoch': epoch,
+                        }, checkpoint_path)
 
         print(f"* DEV loss {test_stats['loss']:.3f} Min DEV loss {min_loss}")
         if args.run:
@@ -391,8 +419,16 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
             cl_loss = cl_criterion(frames_feature, margin=margin)
 
             ml_loss = (loss_imgs + loss_texts) / 2.
-            total_loss = ml_loss + 0.05 * cl_loss
-        loss_scaler(total_loss, optimizer)
+            
+            if epoch < 15:
+                total_loss = ml_loss
+            else:
+                total_loss = ml_loss + 0.005 * cl_loss
+            
+        scaled_loss = model.scale(total_loss)
+        scaled_loss.backward()
+        model.step()
+        #loss_scaler(total_loss, optimizer)
 
         #with torch.no_grad():
         #    model.module.logit_scale.clamp_(math.log(1/100), math.log(100))
@@ -563,7 +599,7 @@ def main_extract_features(args, config):
 
     # Dataset and DataLoader setup
     print("Preparing data...")
-    split = "train"
+    split = "dev"
     tokenizer = MBartTokenizer.from_pretrained(config['model']['transformer'])
     dev_data = S2T_Dataset(path=config['data'][f'{split}_label_path'], tokenizer=tokenizer, config=config, args=args,
                            phase='val')
@@ -575,18 +611,15 @@ def main_extract_features(args, config):
     model = SLRCLIP(config=config).to(device)
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
-        # Filter and load FeatureExtracter parameters
-        feature_extracter_params = {k: v for k, v in checkpoint['model'].items() if
-                                    'model_images.model.' in k}
-        model.load_state_dict(feature_extracter_params, strict=False)
+        model.load_state_dict(checkpoint['model'], strict=False)
 
     # Extract and save features
-    # output_file = os.path.join(args.output_dir, f"{split}_extracted_features")
+    output_file = os.path.join(args.output_dir, f"{split}_extracted_features")
 
-    output_directory = "./GFSLT-VLP/data/Phonexi-2014T/GFSLT_VLP_SignCL/"
-    output_file = f"{output_directory}phoenix14t.pami0.{split}"
+    # output_directory = "./GFSLT-VLP/data/Phonexi-2014T/GFSLT_VLP_SignCL/"
+    # output_file = f"{output_directory}phoenix14t.pami0.{split}"
     # 创建目录（如果不存在）
-    os.makedirs(output_directory, exist_ok=True)
+    # os.makedirs(output_directory, exist_ok=True)
 
     extract_sign_features(args, dev_dataloader, model, output_file, split=split)
     print(f"Features extracted and saved to {output_file}")
