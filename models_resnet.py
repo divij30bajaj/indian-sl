@@ -14,7 +14,6 @@ import torchvision
 from torch.nn.utils.rnn import pad_sequence
 # import pytorchvideo.models.x3d as x3d
 import utils as utils
-from local_transformer import LocalTransformerEncoder
 
 """ PyTorch MBART model."""
 from transformers import MBartForConditionalGeneration, MBartPreTrainedModel, MBartModel, MBartConfig
@@ -27,11 +26,10 @@ from transformers.modeling_outputs import (
     Seq2SeqQuestionAnsweringModelOutput,
     Seq2SeqSequenceClassifierOutput,
 )
-from transformers import AutoImageProcessor, AutoModel
 from transformers.models.mbart.modeling_mbart import shift_tokens_right
 
 from transformers.models.mbart.modeling_mbart import MBartLearnedPositionalEmbedding, MBartEncoderLayer
-from peft import LoraConfig, get_peft_model
+
 from collections import OrderedDict
 
 import copy
@@ -48,7 +46,28 @@ from definition import *
 from hpman.m import _
 from pathlib import Path
 
+
 from torch.distributed.nn.functional import all_gather
+#import torch.distributed as dist
+
+
+
+#def gather_no_grad_with_local_grad(x: torch.Tensor) -> torch.Tensor:
+#    if (not dist.is_available()) or (not dist.is_initialized()):
+#        return x
+
+#    world_size = dist.get_world_size()
+#    rank = dist.get_rank()
+
+#    # gather detached tensors
+#    xs = [torch.zeros_like(x) for _ in range(world_size)]
+#    dist.all_gather(xs, x.detach())
+#    out = torch.cat(xs, dim=0)
+
+#    # put local tensor back so local slice has grad
+#    b = x.shape[0]
+#    out[rank * b : (rank + 1) * b] = x
+#    return out
 
 
 def gather_with_grad(x: torch.Tensor) -> torch.Tensor:
@@ -79,116 +98,39 @@ class PositionalEncoding(nn.Module):
         return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
-class DinoV2FrameEncoder(nn.Module):
-    def __init__(
-        self,
-        model_name="facebook/dinov2-base",
-        out_dim=768,
-        freeze_backbone=True,
-        use_lora=True,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.0,
-        top_n_lora_layers=2
-    ):
-        super().__init__()
+def make_resnet(name='resnet18'):
+    if name == 'resnet18':
+        model = torchvision.models.resnet18(pretrained=True)
+    elif name == 'resnet34':
+        model = torchvision.models.resnet34(pretrained=True)
+    elif name == 'resnet50':
+        model = torchvision.models.resnet50(pretrained=True)
+    elif name == 'resnet101':
+        model = torchvision.models.resnet101(pretrained=True)
+    else:
+        raise Exception('There are no supported resnet model {}.'.format(_('resnet')))
 
-        self.backbone = AutoModel.from_pretrained(model_name)
+    inchannel = model.fc.in_features
+    model.fc = nn.Identity()
+    return model
 
-        hidden_size = self.backbone.config.hidden_size  # 768 for dinov2-base
 
-        # Optional projection so output matches your temporal transformer input dim
-        if out_dim is None or out_dim == hidden_size:
-            self.proj = nn.Identity()
-            self.out_dim = hidden_size
-        else:
-            self.proj = nn.Linear(hidden_size, out_dim)
-            self.out_dim = out_dim
-
-        if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-
-        if use_lora:
-            num_layers = len(self.backbone.encoder.layer)
-            start_layer = max(0, num_layers - top_n_lora_layers)
-
-            target_modules = []
-            for i in range(start_layer, num_layers):
-                prefix = f"encoder.layer.{i}"
-                target_modules.extend([
-                    f"{prefix}.attention.attention.query",
-                    f"{prefix}.attention.attention.key",
-                    f"{prefix}.attention.attention.value",
-                    f"{prefix}.attention.output.dense",
-                    #f"{prefix}.mlp.fc1",
-                    #f"{prefix}.mlp.fc2",
-                ])
-
-            peft_config = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                bias="none",
-                target_modules=target_modules,
-            )
-
-            self.backbone = get_peft_model(self.backbone, peft_config)
-
-        for p in self.proj.parameters():
-            p.requires_grad = True
+class resnet(nn.Module):
+    def __init__(self):
+        super(resnet, self).__init__()
+        self.resnet = make_resnet(name='resnet34')
 
     def forward(self, x, lengths):
-        """
-        x: [total_frames, C, H, W]
-        lengths: [B] frame counts for each video after your padding/trimming
-        """
-
-        # DINOv2 expects normalized pixel values.
-        # If your dataset pipeline already does DINO-style resize/normalize,
-        # you can skip extra preprocessing here.
-        outputs = self.backbone(pixel_values=x)
-
-        # CLS token per frame: [total_frames, hidden_size]
-        frame_feats = outputs.last_hidden_state[:, 0, :]
-
-        # Optional projection
-        frame_feats = self.proj(frame_feats)  # [total_frames, out_dim]
-
-        # Split back into videos using lengths
+        x = self.resnet(x)
         x_batch = []
         start = 0
-        for length in lengths.tolist():
+        for length in lengths:
+            length = int(length.item())
             end = start + length
-            x_batch.append(frame_feats[start:end])
+            x_batch.append(x[start:end])
             start = end
-
-        # Pad to [B, max_T, out_dim]
-        x_padded = pad_sequence(x_batch, padding_value=PAD_IDX, batch_first=True)
-
-        return x_padded
-
-
-def make_head(inplanes, planes, head_type):
-    if head_type == 'linear':
-        return nn.Linear(inplanes, planes, bias=False)
-    else:
-        return nn.Identity()
-
-
-class TextCLIP(nn.Module):
-    def __init__(self, config=None, inplanes=1024, planes=1024, head_type='identy'):
-        super(TextCLIP, self).__init__()
-
-        self.model_txt = MBartForConditionalGeneration.from_pretrained(config['model']['transformer']).get_encoder()
-
-        self.lm_head = make_head(inplanes, planes, head_type)
-
-    def forward(self, tgt_input):
-        txt_logits = \
-        self.model_txt(input_ids=tgt_input['input_ids'].cuda(), attention_mask=tgt_input['attention_mask'].cuda())[0]
-        output = txt_logits[torch.arange(txt_logits.shape[0]), tgt_input['input_ids'].argmax(dim=-1)]
-        return self.lm_head(output), txt_logits
+        x = pad_sequence(x_batch, padding_value=PAD_IDX, batch_first=True)
+        return x
 
 
 class TemporalConv(nn.Module):
@@ -223,15 +165,34 @@ class TemporalConv(nn.Module):
         return x.permute(0, 2, 1)
 
 
+def make_head(inplanes, planes, head_type):
+    if head_type == 'linear':
+        return nn.Linear(inplanes, planes, bias=False)
+    else:
+        return nn.Identity()
+
+
+class TextCLIP(nn.Module):
+    def __init__(self, config=None, inplanes=1024, planes=1024, head_type='identy'):
+        super(TextCLIP, self).__init__()
+
+        self.model_txt = MBartForConditionalGeneration.from_pretrained(config['model']['transformer']).get_encoder()
+
+        self.lm_head = make_head(inplanes, planes, head_type)
+
+    def forward(self, tgt_input):
+        txt_logits = \
+        self.model_txt(input_ids=tgt_input['input_ids'].cuda(), attention_mask=tgt_input['attention_mask'].cuda())[0]
+        output = txt_logits[torch.arange(txt_logits.shape[0]), tgt_input['input_ids'].argmax(dim=-1)]
+        return self.lm_head(output), txt_logits
+
+
 class ImageCLIP(nn.Module):
     def __init__(self, config, inplanes=1024, planes=1024, head_type='linear'):
         super(ImageCLIP, self).__init__()
         self.config = config
-        self.model = DinoV2FrameEncoder()  # jinhui
+        self.model = FeatureExtracter()  # jinhui
 
-        self.conv_1d = TemporalConv(input_size=768, hidden_size=1024, conv_type=2)
-        # self.local_encoder = LocalTransformerEncoder(dim=768)
-        # self.mbart_proj = nn.Linear(768, 1024)
         self.trans_encoder = MBartForConditionalGeneration.from_pretrained(
             config['model']['visual_encoder']).get_encoder()
         self.cls_token = nn.Parameter(torch.randn(1, 1, inplanes))
@@ -239,16 +200,9 @@ class ImageCLIP(nn.Module):
         self.lm_head = make_head(inplanes, planes, head_type)
 
     def forward(self, src_input):
-        x = self.model(src_input['input_ids'].cuda(), src_input['src_length_batch'])  # [b, n, c]
+        x, images = self.model(src_input['input_ids'].cuda(), src_input['src_length_batch'])  # [b, n, c]
         attention_mask = src_input['attention_mask']
         frames_feature = x
-
-        x = self.conv_1d(x)
-        # x = self.local_encoder(x, attention_mask=attention_mask)
-        # x = x[:, ::4, :]
-        # attention_mask = attention_mask[:, ::4]
-
-        # x = self.mbart_proj(x)
 
         B, N, C = x.shape
         cls_token = repeat(self.cls_token, '() n d -> b n d', b=B)
@@ -265,7 +219,7 @@ class ImageCLIP(nn.Module):
         #output = (x * mask).sum(dim=1) / (mask.sum(dim=1).clamp_min(1.0))  # [B,C]
         #output = self.lm_head(output)
 
-        return output, frames_feature
+        return output, images
 
 
 class Text_Decoder(nn.Module):
@@ -365,6 +319,22 @@ class SLRCLIP(nn.Module):
         # all_text_features  = gather_with_grad(text_features)
 
         return video_features, text_features
+
+
+class FeatureExtracter(nn.Module):
+    def __init__(self):
+        super(FeatureExtracter, self).__init__()
+        self.conv_2d = resnet()  # InceptionI3d()
+        self.conv_1d = TemporalConv(input_size=512, hidden_size=1024, conv_type=2)
+
+    def forward(self,
+                src: Tensor,
+                src_length_batch
+                ):
+        images = self.conv_2d(src, src_length_batch)
+        src = self.conv_1d(images)
+
+        return src, images
 
 
 class Attention(nn.Module):
@@ -539,15 +509,15 @@ class V_encoder(nn.Module):
 
 
 def config_decoder(config):
-    decoder_type = 'LD'
+    decoder_type = _('decoder_type', 'LD', choices=['LD', 'LLMD'])
     config['model']["decoder_type"] = decoder_type
     if decoder_type == 'LD':
         return MBartForConditionalGeneration.from_pretrained(config['model']['visual_encoder'],
-                                                             ignore_mismatched_sizes=False, config=Path(
+                                                             ignore_mismatched_sizes=True, config=Path(
                 config['model']['visual_encoder'])/'config.json')
     elif decoder_type == 'LLMD':
         return MBartForConditionalGeneration.from_pretrained(config['model']['transformer'],
-                                                             ignore_mismatched_sizes=False, config=Path(
+                                                             ignore_mismatched_sizes=True, config=Path(
                 config['model']['transformer'])/'LLMD_config.json')
 
 
@@ -557,8 +527,7 @@ class gloss_free_model(nn.Module):
         self.config = config
         self.args = args
 
-        self.backbone = DinoV2FrameEncoder()  # jinhui
-        self.conv_1d = TemporalConv(input_size=768, hidden_size=1024, conv_type=2)
+        self.backbone = FeatureExtracter()  # resenet + 1d conv
         # self.mbart = MBartForConditionalGeneration.from_pretrained(config['model']['visual_encoder'])
         self.mbart = config_decoder(config)
 
@@ -570,11 +539,9 @@ class gloss_free_model(nn.Module):
             self.embed_scale = 1.0
 
     def share_forward(self, src_input):
-        frames_feature = self.backbone(src_input['input_ids'].cuda(), src_input['src_length_batch'])
+
+        frames_feature, image_feats = self.backbone(src_input['input_ids'].cuda(), src_input['src_length_batch'])
         attention_mask = src_input['attention_mask']
-        
-        image_feats = frames_feature
-        frames_feature = self.conv_1d(frames_feature)
 
         inputs_embeds = self.sign_emb(frames_feature)
         inputs_embeds = self.embed_scale * inputs_embeds
